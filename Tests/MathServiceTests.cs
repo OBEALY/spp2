@@ -34,13 +34,13 @@ public sealed class MathServiceTests
     [BeforeEach]
     private void SetUp()
     {
-        _beforeEachCalls++;
+        Interlocked.Increment(ref _beforeEachCalls);
     }
 
     [AfterEach]
     private void TearDown()
     {
-        _afterEachCalls++;
+        Interlocked.Increment(ref _afterEachCalls);
     }
 
     [Test]
