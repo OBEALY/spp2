@@ -85,38 +85,38 @@ public sealed class OrderPricingServiceTests
 
     [Test]
     [TestInfo("Discount boundaries are validated", priority: 3)]
-    public async Task CalculateTotal_InvalidDiscount_ShouldThrow()
+    public void CalculateTotal_InvalidDiscount_ShouldThrow()
     {
         var items = new[]
         {
             new OrderItem("LAMP", 25m, 1)
         };
 
-        await AssertEx.ThrowsAsync<ArgumentOutOfRangeException>(() =>
-            Task.Run(() => _service.CalculateTotal(items, discountPercent: 80m)));
+        AssertEx.Throws<ArgumentOutOfRangeException>(() =>
+            _service.CalculateTotal(items, discountPercent: 80m));
     }
 
     [Test]
     [TestInfo("Item quantity and price are validated", priority: 3)]
-    public async Task CalculateTotal_InvalidItem_ShouldThrow()
+    public void CalculateTotal_InvalidItem_ShouldThrow()
     {
         var items = new[]
         {
             new OrderItem("TABLE", 0m, 1)
         };
 
-        await AssertEx.ThrowsAsync<ArgumentOutOfRangeException>(() =>
-            Task.Run(() => _service.CalculateTotal(items)));
+        AssertEx.Throws<ArgumentOutOfRangeException>(() =>
+            _service.CalculateTotal(items));
     }
 
     [Test]
     [TestInfo("Order must contain items", priority: 3)]
-    public async Task CalculateTotal_EmptyOrder_ShouldThrow()
+    public void CalculateTotal_EmptyOrder_ShouldThrow()
     {
         var items = Array.Empty<OrderItem>();
 
-        await AssertEx.ThrowsAsync<ArgumentException>(() =>
-            Task.Run(() => _service.CalculateTotal(items)));
+        AssertEx.Throws<ArgumentException>(() =>
+            _service.CalculateTotal(items));
     }
 
     [TestCase(0)]

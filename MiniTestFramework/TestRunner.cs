@@ -1,23 +1,54 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
+using DynamicThreadPoolModule;
 
 namespace MiniTestFramework;
 
 public sealed class TestRunner
 {
-    public Task<TestRunReport> RunAsync(Assembly assembly) =>
-        RunAsync(assembly, new TestRunnerOptions(), liveOutput: null);
-
     public async Task<TestRunReport> RunAsync(
         Assembly assembly,
         TestRunnerOptions options,
         ITestOutput? liveOutput = null,
         CancellationToken cancellationToken = default)
     {
+        var report = await ExecuteAsync(
+            assembly,
+            options,
+            simulationOptions: null,
+            liveOutput,
+            cancellationToken);
+
+        return report.TestReport;
+    }
+
+    public Task<TestRunReport> RunAsync(Assembly assembly) =>
+        RunAsync(assembly, new TestRunnerOptions(), liveOutput: null);
+
+    public Task<LoadSimulationReport> RunLoadSimulationAsync(
+        Assembly assembly,
+        TestRunnerOptions options,
+        LoadSimulationOptions simulationOptions,
+        ITestOutput? liveOutput = null,
+        CancellationToken cancellationToken = default)
+    {
+        return ExecuteAsync(assembly, options, simulationOptions, liveOutput, cancellationToken);
+    }
+
+    private static async Task<LoadSimulationReport> ExecuteAsync(
+        Assembly assembly,
+        TestRunnerOptions options,
+        LoadSimulationOptions? simulationOptions,
+        ITestOutput? liveOutput,
+        CancellationToken cancellationToken)
+    {
         ArgumentNullException.ThrowIfNull(assembly);
         ArgumentNullException.ThrowIfNull(options);
+
         options.Validate();
+        simulationOptions?.Validate();
 
         var runStopwatch = Stopwatch.StartNew();
         var results = new ConcurrentBag<TestCaseResult>();
@@ -32,38 +63,180 @@ public sealed class TestRunner
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var classContext = await PrepareTestClassAsync(testType, results, liveOutput, cancellationToken);
+            var classContext = PrepareTestClass(testType, results, liveOutput);
             if (classContext is not null)
             {
                 classContexts.Add(classContext);
             }
         }
 
-        using var semaphore = new SemaphoreSlim(options.MaxDegreeOfParallelism);
         var plannedTests = classContexts
             .SelectMany(c => c.Tests.Select(t => new PlannedTest(c, t)))
             .ToArray();
 
-        var executionTasks = plannedTests
-            .Select(plan => RunTestWithSemaphoreAsync(semaphore, plan, options, results, liveOutput, cancellationToken))
-            .ToArray();
+        var completion = new CompletionCounter();
+        var submittedCount = 0;
+        DynamicThreadPoolStatistics poolStatistics;
 
-        await Task.WhenAll(executionTasks);
+        var pool = new DynamicThreadPool(
+            options.ToThreadPoolOptions(),
+            line => PublishLine(liveOutput, line));
+
+        try
+        {
+            if (simulationOptions is null)
+            {
+                submittedCount = QueueImmediateRun(pool, completion, plannedTests, options, results, liveOutput);
+            }
+            else
+            {
+                PublishLine(
+                    liveOutput,
+                    $"[LOAD] Starting simulated load. Planned submissions: {simulationOptions.TotalSubmissions}.");
+
+                submittedCount = await QueueSimulatedLoadAsync(
+                    pool,
+                    completion,
+                    plannedTests,
+                    simulationOptions,
+                    options,
+                    results,
+                    liveOutput,
+                    cancellationToken);
+            }
+
+            completion.Wait(cancellationToken);
+        }
+        finally
+        {
+            pool.Dispose();
+            poolStatistics = pool.GetStatistics();
+        }
 
         foreach (var classContext in classContexts)
         {
-            await FinalizeTestClassAsync(classContext, results, liveOutput, cancellationToken);
+            FinalizeTestClass(classContext, results, liveOutput);
         }
 
         runStopwatch.Stop();
 
-        return new TestRunReport
+        return new LoadSimulationReport
         {
-            Results = results
-                .OrderBy(r => r.DisplayName, StringComparer.Ordinal)
-                .ToArray(),
-            Duration = runStopwatch.Elapsed
+            SubmittedCount = submittedCount,
+            PoolStatistics = poolStatistics,
+            TestReport = new TestRunReport
+            {
+                Results = results
+                    .OrderBy(r => r.DisplayName, StringComparer.Ordinal)
+                    .ToArray(),
+                Duration = runStopwatch.Elapsed
+            }
         };
+    }
+
+    private static int QueueImmediateRun(
+        DynamicThreadPool pool,
+        CompletionCounter completion,
+        PlannedTest[] plannedTests,
+        TestRunnerOptions options,
+        ConcurrentBag<TestCaseResult> results,
+        ITestOutput? liveOutput)
+    {
+        var submittedCount = 0;
+
+        foreach (var plan in plannedTests)
+        {
+            var launch = new ScheduledLaunch(plan, ++submittedCount, $"{plan.Test.DisplayName}#run{submittedCount:000}");
+            EnqueueLaunch(pool, completion, launch, options, results, liveOutput);
+        }
+
+        return submittedCount;
+    }
+
+    private static async Task<int> QueueSimulatedLoadAsync(
+        DynamicThreadPool pool,
+        CompletionCounter completion,
+        PlannedTest[] plannedTests,
+        LoadSimulationOptions simulationOptions,
+        TestRunnerOptions options,
+        ConcurrentBag<TestCaseResult> results,
+        ITestOutput? liveOutput,
+        CancellationToken cancellationToken)
+    {
+        if (plannedTests.Length == 0)
+        {
+            return 0;
+        }
+
+        var submittedCount = 0;
+        var planCursor = 0;
+
+        foreach (var phase in simulationOptions.Phases)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            PublishLine(
+                liveOutput,
+                $"[LOAD] Phase '{phase.Name}': submissions={phase.SubmissionCount}, interval={phase.IntervalBetweenSubmissions.TotalMilliseconds:F0} ms.");
+
+            for (var i = 0; i < phase.SubmissionCount; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var plan = plannedTests[planCursor % plannedTests.Length];
+                planCursor++;
+                submittedCount++;
+
+                var launch = new ScheduledLaunch(
+                    plan,
+                    submittedCount,
+                    $"{plan.Test.DisplayName}#load{submittedCount:000}");
+
+                EnqueueLaunch(pool, completion, launch, options, results, liveOutput);
+                PublishLine(liveOutput, $"[LOAD] queued {launch.DisplayName}");
+
+                if (phase.IntervalBetweenSubmissions > TimeSpan.Zero)
+                {
+                    await Task.Delay(phase.IntervalBetweenSubmissions, cancellationToken);
+                }
+            }
+
+            if (phase.PauseAfterPhase > TimeSpan.Zero)
+            {
+                PublishLine(
+                    liveOutput,
+                    $"[LOAD] pause after '{phase.Name}' for {phase.PauseAfterPhase.TotalMilliseconds:F0} ms.");
+
+                await Task.Delay(phase.PauseAfterPhase, cancellationToken);
+            }
+        }
+
+        return submittedCount;
+    }
+
+    private static void EnqueueLaunch(
+        DynamicThreadPool pool,
+        CompletionCounter completion,
+        ScheduledLaunch launch,
+        TestRunnerOptions options,
+        ConcurrentBag<TestCaseResult> results,
+        ITestOutput? liveOutput)
+    {
+        completion.Add();
+
+        pool.Enqueue(
+            launch.DisplayName,
+            () =>
+            {
+                try
+                {
+                    RunSingleTest(launch, options, results, liveOutput);
+                }
+                finally
+                {
+                    completion.Signal();
+                }
+            });
     }
 
     private static bool IsTestClass(Type type)
@@ -72,19 +245,19 @@ public sealed class TestRunner
                || type.GetCustomAttribute<TestClassInfoAttribute>() is not null;
     }
 
-    private static async Task<TestClassContext?> PrepareTestClassAsync(
+    private static TestClassContext? PrepareTestClass(
         Type testType,
         ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
+        ITestOutput? liveOutput)
     {
         ISharedContext? sharedContext = null;
 
         try
         {
-            sharedContext = await TryCreateSharedContextAsync(testType);
+            sharedContext = TryCreateSharedContext(testType);
             var instance = Activator.CreateInstance(testType)
                            ?? throw new TestDiscoveryException($"Cannot create an instance of {testType.Name}.");
+
             InjectSharedContextIfNeeded(instance, sharedContext);
 
             var beforeAll = FindLifecycleMethods(testType, typeof(BeforeAllAttribute));
@@ -95,11 +268,11 @@ public sealed class TestRunner
 
             try
             {
-                await InvokeLifecycleAsync(instance, beforeAll, "BeforeAll", cancellationToken);
+                InvokeLifecycle(instance, beforeAll, "BeforeAll");
             }
             catch (Exception ex)
             {
-                await AddLifecycleErrorAsync(testType, "BeforeAll", ex, results, liveOutput, cancellationToken);
+                AddLifecycleError(testType, "BeforeAll", ex, results, liveOutput);
                 sharedContext?.Dispose();
                 return null;
             }
@@ -120,19 +293,18 @@ public sealed class TestRunner
         }
     }
 
-    private static async Task FinalizeTestClassAsync(
+    private static void FinalizeTestClass(
         TestClassContext classContext,
         ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
+        ITestOutput? liveOutput)
     {
         try
         {
-            await InvokeLifecycleAsync(classContext.Instance, classContext.AfterAll, "AfterAll", cancellationToken);
+            InvokeLifecycle(classContext.Instance, classContext.AfterAll, "AfterAll");
         }
         catch (Exception ex)
         {
-            await AddLifecycleErrorAsync(classContext.TestType, "AfterAll", ex, results, liveOutput, cancellationToken);
+            AddLifecycleError(classContext.TestType, "AfterAll", ex, results, liveOutput);
         }
         finally
         {
@@ -140,135 +312,128 @@ public sealed class TestRunner
         }
     }
 
-    private static async Task RunTestWithSemaphoreAsync(
-        SemaphoreSlim semaphore,
-        PlannedTest plan,
+    private static void RunSingleTest(
+        ScheduledLaunch launch,
         TestRunnerOptions options,
         ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
-    {
-        await semaphore.WaitAsync(cancellationToken);
-        try
-        {
-            await RunSingleTestAsync(plan, options, results, liveOutput, cancellationToken);
-        }
-        finally
-        {
-            semaphore.Release();
-        }
-    }
-
-    private static async Task RunSingleTestAsync(
-        PlannedTest plan,
-        TestRunnerOptions options,
-        ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
+        ITestOutput? liveOutput)
     {
         var sw = Stopwatch.StartNew();
-        var instance = plan.ClassContext.Instance;
-        var entry = plan.Test;
+        var instance = launch.Plan.ClassContext.Instance;
+        var entry = launch.Plan.Test;
 
         try
         {
-            await InvokeLifecycleAsync(instance, plan.ClassContext.BeforeEach, "BeforeEach", cancellationToken);
+            InvokeLifecycle(instance, launch.Plan.ClassContext.BeforeEach, "BeforeEach");
         }
         catch (Exception ex)
         {
-            await AddResultAsync(new TestCaseResult
-            {
-                ClassName = instance.GetType().Name,
-                MethodName = entry.Method.Name,
-                DisplayName = entry.DisplayName,
-                Status = TestStatus.Error,
-                Message = ex.InnerException?.Message ?? ex.Message,
-                Duration = sw.Elapsed
-            }, results, liveOutput, cancellationToken);
+            AddResult(
+                new TestCaseResult
+                {
+                    ClassName = instance.GetType().Name,
+                    MethodName = entry.Method.Name,
+                    DisplayName = launch.DisplayName,
+                    Status = TestStatus.Error,
+                    Message = ex.InnerException?.Message ?? ex.Message,
+                    Duration = sw.Elapsed
+                },
+                results,
+                liveOutput);
+
             return;
         }
 
         try
         {
             var timeoutMilliseconds = entry.TimeoutMilliseconds ?? options.DefaultTimeoutMilliseconds;
-            await InvokeMethodWithTimeoutAsync(
-                instance,
-                entry.Method,
-                entry.Args,
-                timeoutMilliseconds,
-                cancellationToken);
+            InvokeMethodWithTimeout(instance, entry.Method, entry.Args, timeoutMilliseconds);
 
-            await AddResultAsync(new TestCaseResult
-            {
-                ClassName = instance.GetType().Name,
-                MethodName = entry.Method.Name,
-                DisplayName = entry.DisplayName,
-                Status = TestStatus.Passed,
-                Duration = sw.Elapsed
-            }, results, liveOutput, cancellationToken);
+            AddResult(
+                new TestCaseResult
+                {
+                    ClassName = instance.GetType().Name,
+                    MethodName = entry.Method.Name,
+                    DisplayName = launch.DisplayName,
+                    Status = TestStatus.Passed,
+                    Duration = sw.Elapsed
+                },
+                results,
+                liveOutput);
         }
         catch (AssertionFailedException ex)
         {
-            await AddResultAsync(new TestCaseResult
-            {
-                ClassName = instance.GetType().Name,
-                MethodName = entry.Method.Name,
-                DisplayName = entry.DisplayName,
-                Status = TestStatus.Failed,
-                Message = ex.Message,
-                Duration = sw.Elapsed
-            }, results, liveOutput, cancellationToken);
+            AddResult(
+                new TestCaseResult
+                {
+                    ClassName = instance.GetType().Name,
+                    MethodName = entry.Method.Name,
+                    DisplayName = launch.DisplayName,
+                    Status = TestStatus.Failed,
+                    Message = ex.Message,
+                    Duration = sw.Elapsed
+                },
+                results,
+                liveOutput);
         }
         catch (TestTimeoutException ex)
         {
-            await AddResultAsync(new TestCaseResult
-            {
-                ClassName = instance.GetType().Name,
-                MethodName = entry.Method.Name,
-                DisplayName = entry.DisplayName,
-                Status = TestStatus.TimedOut,
-                Message = ex.Message,
-                Duration = sw.Elapsed
-            }, results, liveOutput, cancellationToken);
+            AddResult(
+                new TestCaseResult
+                {
+                    ClassName = instance.GetType().Name,
+                    MethodName = entry.Method.Name,
+                    DisplayName = launch.DisplayName,
+                    Status = TestStatus.TimedOut,
+                    Message = ex.Message,
+                    Duration = sw.Elapsed
+                },
+                results,
+                liveOutput);
         }
         catch (Exception ex)
         {
-            await AddResultAsync(new TestCaseResult
-            {
-                ClassName = instance.GetType().Name,
-                MethodName = entry.Method.Name,
-                DisplayName = entry.DisplayName,
-                Status = TestStatus.Error,
-                Message = ex.InnerException?.Message ?? ex.Message,
-                Duration = sw.Elapsed
-            }, results, liveOutput, cancellationToken);
+            AddResult(
+                new TestCaseResult
+                {
+                    ClassName = instance.GetType().Name,
+                    MethodName = entry.Method.Name,
+                    DisplayName = launch.DisplayName,
+                    Status = TestStatus.Error,
+                    Message = ex.InnerException?.Message ?? ex.Message,
+                    Duration = sw.Elapsed
+                },
+                results,
+                liveOutput);
         }
         finally
         {
             try
             {
-                await InvokeLifecycleAsync(instance, plan.ClassContext.AfterEach, "AfterEach", cancellationToken);
+                InvokeLifecycle(instance, launch.Plan.ClassContext.AfterEach, "AfterEach");
             }
             catch (Exception ex)
             {
-                await AddResultAsync(new TestCaseResult
-                {
-                    ClassName = instance.GetType().Name,
-                    MethodName = entry.Method.Name,
-                    DisplayName = $"{entry.DisplayName}::AfterEach",
-                    Status = TestStatus.Error,
-                    Message = ex.InnerException?.Message ?? ex.Message,
-                    Duration = sw.Elapsed
-                }, results, liveOutput, cancellationToken);
+                AddResult(
+                    new TestCaseResult
+                    {
+                        ClassName = instance.GetType().Name,
+                        MethodName = entry.Method.Name,
+                        DisplayName = $"{launch.DisplayName}::AfterEach",
+                        Status = TestStatus.Error,
+                        Message = ex.InnerException?.Message ?? ex.Message,
+                        Duration = sw.Elapsed
+                    },
+                    results,
+                    liveOutput);
             }
         }
     }
 
-    private static async Task AddResultAsync(
+    private static void AddResult(
         TestCaseResult result,
         ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
+        ITestOutput? liveOutput)
     {
         results.Add(result);
 
@@ -279,32 +444,34 @@ public sealed class TestRunner
                 : result.Message.Replace(Environment.NewLine, " ");
 
             var line =
-                $"[{DateTime.Now:HH:mm:ss.fff}] {result.Status,-8} {result.DisplayName,-60} {result.Duration.TotalMilliseconds,8:F1} ms | {message}";
+                $"[{DateTime.Now:HH:mm:ss.fff}] {result.Status,-8} {result.DisplayName,-72} {result.Duration.TotalMilliseconds,8:F1} ms | {message}";
 
-            await liveOutput.WriteLineAsync(line, cancellationToken);
+            PublishLine(liveOutput, line);
         }
     }
 
-    private static async Task AddLifecycleErrorAsync(
+    private static void AddLifecycleError(
         Type testType,
         string stage,
         Exception ex,
         ConcurrentBag<TestCaseResult> results,
-        ITestOutput? liveOutput,
-        CancellationToken cancellationToken)
+        ITestOutput? liveOutput)
     {
-        await AddResultAsync(new TestCaseResult
-        {
-            ClassName = testType.Name,
-            MethodName = stage,
-            DisplayName = $"{testType.Name}::{stage}",
-            Status = TestStatus.Error,
-            Message = ex.InnerException?.Message ?? ex.Message,
-            Duration = TimeSpan.Zero
-        }, results, liveOutput, cancellationToken);
+        AddResult(
+            new TestCaseResult
+            {
+                ClassName = testType.Name,
+                MethodName = stage,
+                DisplayName = $"{testType.Name}::{stage}",
+                Status = TestStatus.Error,
+                Message = ex.InnerException?.Message ?? ex.Message,
+                Duration = TimeSpan.Zero
+            },
+            results,
+            liveOutput);
     }
 
-    private static async Task<ISharedContext?> TryCreateSharedContextAsync(Type testType)
+    private static ISharedContext? TryCreateSharedContext(Type testType)
     {
         var useShared = testType.GetCustomAttribute<UseSharedContextAttribute>();
         if (useShared is null)
@@ -320,7 +487,7 @@ public sealed class TestRunner
         var context = Activator.CreateInstance(useShared.ContextType) as ISharedContext
                       ?? throw new TestDiscoveryException($"Cannot create shared context: {useShared.ContextType.Name}.");
 
-        await context.InitializeAsync();
+        context.InitializeAsync().GetAwaiter().GetResult();
         return context;
     }
 
@@ -386,19 +553,13 @@ public sealed class TestRunner
         return entries;
     }
 
-    private static async Task InvokeLifecycleAsync(
-        object instance,
-        List<MethodInfo> methods,
-        string stageName,
-        CancellationToken cancellationToken)
+    private static void InvokeLifecycle(object instance, List<MethodInfo> methods, string stageName)
     {
         foreach (var method in methods)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
             try
             {
-                await InvokeMethodAsync(instance, method, Array.Empty<object?>());
+                InvokeMethod(instance, method, Array.Empty<object?>());
             }
             catch (Exception ex)
             {
@@ -407,52 +568,47 @@ public sealed class TestRunner
         }
     }
 
-    private static async Task InvokeMethodWithTimeoutAsync(
+    private static void InvokeMethodWithTimeout(
         object instance,
         MethodInfo method,
         object?[] args,
-        int? timeoutMilliseconds,
-        CancellationToken cancellationToken)
+        int? timeoutMilliseconds)
     {
         if (timeoutMilliseconds is null)
         {
-            await RunMethodOnThreadPoolAsync(instance, method, args, cancellationToken);
+            InvokeMethod(instance, method, args);
             return;
         }
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        var invocationTask = RunMethodOnThreadPoolAsync(instance, method, args, timeoutCts.Token);
-        var timeoutTask = Task.Delay(timeoutMilliseconds.Value, cancellationToken);
-        var completedTask = await Task.WhenAny(invocationTask, timeoutTask);
+        ExceptionDispatchInfo? capturedException = null;
 
-        if (completedTask == timeoutTask)
+        var invocationThread = new Thread(() =>
         {
-            timeoutCts.Cancel();
+            try
+            {
+                InvokeMethod(instance, method, args);
+            }
+            catch (Exception ex)
+            {
+                capturedException = ExceptionDispatchInfo.Capture(ex);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = $"TestInvocation-{instance.GetType().Name}.{method.Name}"
+        };
 
-            _ = invocationTask.ContinueWith(
-                t => _ = t.Exception,
-                CancellationToken.None,
-                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
+        invocationThread.Start();
 
+        if (!invocationThread.Join(timeoutMilliseconds.Value))
+        {
             throw new TestTimeoutException($"Timeout exceeded ({timeoutMilliseconds.Value} ms).");
         }
 
-        await invocationTask;
+        capturedException?.Throw();
     }
 
-    private static Task RunMethodOnThreadPoolAsync(
-        object instance,
-        MethodInfo method,
-        object?[] args,
-        CancellationToken cancellationToken)
-    {
-        return Task.Run(
-            async () => await InvokeMethodAsync(instance, method, args),
-            cancellationToken);
-    }
-
-    private static async Task InvokeMethodAsync(object instance, MethodInfo method, object?[] args)
+    private static void InvokeMethod(object instance, MethodInfo method, object?[] args)
     {
         ValidateMethodParameters(method, args);
 
@@ -463,16 +619,17 @@ public sealed class TestRunner
         }
         catch (TargetInvocationException ex) when (ex.InnerException is not null)
         {
-            throw ex.InnerException;
+            ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+            throw;
         }
 
         switch (result)
         {
             case Task task:
-                await task;
+                task.GetAwaiter().GetResult();
                 break;
             case ValueTask valueTask:
-                await valueTask;
+                valueTask.GetAwaiter().GetResult();
                 break;
         }
     }
@@ -502,6 +659,55 @@ public sealed class TestRunner
         }
     }
 
+    private static void PublishLine(ITestOutput? liveOutput, string line)
+    {
+        if (liveOutput is null)
+        {
+            Console.WriteLine(line);
+            return;
+        }
+
+        liveOutput.WriteLineAsync(line).GetAwaiter().GetResult();
+    }
+
+    private sealed class CompletionCounter
+    {
+        private readonly object _gate = new();
+        private int _remaining;
+
+        public void Add()
+        {
+            lock (_gate)
+            {
+                _remaining++;
+            }
+        }
+
+        public void Signal()
+        {
+            lock (_gate)
+            {
+                _remaining--;
+                if (_remaining <= 0)
+                {
+                    Monitor.PulseAll(_gate);
+                }
+            }
+        }
+
+        public void Wait(CancellationToken cancellationToken)
+        {
+            lock (_gate)
+            {
+                while (_remaining > 0)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    Monitor.Wait(_gate, TimeSpan.FromMilliseconds(200));
+                }
+            }
+        }
+    }
+
     private sealed record TestClassContext(
         Type TestType,
         object Instance,
@@ -518,4 +724,9 @@ public sealed class TestRunner
         int? TimeoutMilliseconds);
 
     private readonly record struct PlannedTest(TestClassContext ClassContext, TestMethodEntry Test);
+
+    private readonly record struct ScheduledLaunch(
+        PlannedTest Plan,
+        int LaunchNumber,
+        string DisplayName);
 }

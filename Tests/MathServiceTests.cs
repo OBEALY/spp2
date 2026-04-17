@@ -64,10 +64,9 @@ public sealed class MathServiceTests
     }
 
     [Test]
-    public async Task DivideByZero_ShouldThrow()
+    public void DivideByZero_ShouldThrow()
     {
-        await AssertEx.ThrowsAsync<DivideByZeroException>(() =>
-            Task.Run(() => _math.Divide(10, 0)));
+        AssertEx.Throws<DivideByZeroException>(() => _math.Divide(10, 0));
     }
 
     [Test]

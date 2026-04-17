@@ -1,13 +1,10 @@
-using DynamicThreadPoolModule;
+namespace DynamicThreadPoolModule;
 
-namespace MiniTestFramework;
-
-public sealed class TestRunnerOptions
+public sealed class DynamicThreadPoolOptions
 {
     public int MinWorkerCount { get; init; } = 2;
     public int MaxWorkerCount { get; init; } = Math.Max(4, Environment.ProcessorCount);
     public int ScaleUpStep { get; init; } = 1;
-    public int? DefaultTimeoutMilliseconds { get; init; } = 2_000;
     public TimeSpan WorkerIdleTimeout { get; init; } = TimeSpan.FromSeconds(2);
     public TimeSpan QueueWaitThreshold { get; init; } = TimeSpan.FromMilliseconds(400);
     public TimeSpan MonitorInterval { get; init; } = TimeSpan.FromMilliseconds(250);
@@ -37,28 +34,39 @@ public sealed class TestRunnerOptions
                 "ScaleUpStep must be greater than zero.");
         }
 
-        if (DefaultTimeoutMilliseconds is <= 0)
+        if (WorkerIdleTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(DefaultTimeoutMilliseconds),
-                "DefaultTimeoutMilliseconds must be greater than zero when specified.");
+                nameof(WorkerIdleTimeout),
+                "WorkerIdleTimeout must be greater than zero.");
         }
 
-        ToThreadPoolOptions().Validate();
-    }
-
-    public DynamicThreadPoolOptions ToThreadPoolOptions()
-    {
-        return new DynamicThreadPoolOptions
+        if (QueueWaitThreshold <= TimeSpan.Zero)
         {
-            MinWorkerCount = MinWorkerCount,
-            MaxWorkerCount = MaxWorkerCount,
-            ScaleUpStep = ScaleUpStep,
-            WorkerIdleTimeout = WorkerIdleTimeout,
-            QueueWaitThreshold = QueueWaitThreshold,
-            MonitorInterval = MonitorInterval,
-            WorkerHangThreshold = WorkerHangThreshold,
-            ShutdownJoinTimeout = ShutdownJoinTimeout
-        };
+            throw new ArgumentOutOfRangeException(
+                nameof(QueueWaitThreshold),
+                "QueueWaitThreshold must be greater than zero.");
+        }
+
+        if (MonitorInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(MonitorInterval),
+                "MonitorInterval must be greater than zero.");
+        }
+
+        if (WorkerHangThreshold <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(WorkerHangThreshold),
+                "WorkerHangThreshold must be greater than zero.");
+        }
+
+        if (ShutdownJoinTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ShutdownJoinTimeout),
+                "ShutdownJoinTimeout must be greater than zero.");
+        }
     }
 }

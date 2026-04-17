@@ -7,7 +7,7 @@ public interface ITestOutput : IAsyncDisposable
 
 public sealed class SynchronizedTestOutput : ITestOutput
 {
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _gate = new();
     private readonly StreamWriter? _fileWriter;
     private readonly bool _writeToConsole;
     private bool _disposed;
@@ -32,11 +32,11 @@ public sealed class SynchronizedTestOutput : ITestOutput
 
     public async Task WriteLineAsync(string line, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-
-        await _gate.WaitAsync(cancellationToken);
-        try
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
         {
+            ThrowIfDisposed();
+
             if (_writeToConsole)
             {
                 Console.WriteLine(line);
@@ -44,39 +44,33 @@ public sealed class SynchronizedTestOutput : ITestOutput
 
             if (_fileWriter is not null)
             {
-                await _fileWriter.WriteLineAsync(line);
-                await _fileWriter.FlushAsync();
+                _fileWriter.WriteLine(line);
+                _fileWriter.Flush();
             }
         }
-        finally
-        {
-            _gate.Release();
-        }
+
+        await Task.CompletedTask;
     }
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        lock (_gate)
         {
-            return;
-        }
+            if (_disposed)
+            {
+                return;
+            }
 
-        _disposed = true;
+            _disposed = true;
 
-        await _gate.WaitAsync();
-        try
-        {
             if (_fileWriter is not null)
             {
-                await _fileWriter.FlushAsync();
-                await _fileWriter.DisposeAsync();
+                _fileWriter.Flush();
+                _fileWriter.Dispose();
             }
         }
-        finally
-        {
-            _gate.Release();
-            _gate.Dispose();
-        }
+
+        await ValueTask.CompletedTask;
     }
 
     private void ThrowIfDisposed()

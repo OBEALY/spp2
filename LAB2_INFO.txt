@@ -1,0 +1,136 @@
+﻿ЛАБОРАТОРНАЯ РАБОТА 2 - ОТЧЕТ ПО СТРОКАМ КОДА
+===========================================
+
+Цель
+----
+Оптимизация собственного тестового фреймворка из ЛР1 с использованием многопоточности,
+таймаутов и сравнением производительности последовательного и параллельного запуска.
+
+
+1) Выполнение ТЗ с привязкой к строкам
+--------------------------------------
+
+1. Параллелизм: запуск тестов в нескольких потоках (`Task`/`ThreadPool`)
+- Файл: `MiniTestFramework/TestRunner.cs`
+  - `42-51` — создается `SemaphoreSlim`, формируется список задач и выполняется `Task.WhenAll`.
+  - `143-159` — ограниченный запуск каждого теста через `WaitAsync/Release` (контроль параллелизма).
+  - `444-453` — выполнение тестового метода на пуле потоков (`Task.Run`).
+
+2. Конфигурация: ограничение степени параллелизма (`MaxDegreeOfParallelism`)
+- Файл: `MiniTestFramework/TestRunnerOptions.cs`
+  - `5-6` — параметры `MaxDegreeOfParallelism` и `DefaultTimeoutMilliseconds`.
+  - `8-23` — валидация конфигурации.
+- Файл: `MiniTestFramework/TestRunner.cs`
+  - `20` — вызов `options.Validate()`.
+  - `42` — фактическое применение `options.MaxDegreeOfParallelism`.
+- Файл: `Program.cs`
+  - `8-18` — конфигурация последовательного и параллельного режимов.
+  - `58-68` — чтение значения параллелизма из аргументов запуска.
+
+3. Синхронизация вывода: корректный вывод из разных потоков в консоль/файл
+- Файл: `MiniTestFramework/SynchronizedTestOutput.cs`
+  - `8-13` — поля для синхронизации и ресурсов вывода.
+  - `33-55` — потокобезопасная запись строки (`SemaphoreSlim`, консоль + файл).
+  - `57-80` — безопасное завершение и освобождение ресурсов.
+- Файл: `MiniTestFramework/TestRunner.cs`
+  - `267-285` — централизованная публикация результата теста (`AddResultAsync`) в синхронизированный вывод.
+- Файл: `Program.cs`
+  - `20-21` — пути к live-логам.
+  - `25-36` — передача `SynchronizedTestOutput` в раннер.
+
+4. Время ожидания: атрибут таймаута теста (`[Timeout]`) и отметка при превышении
+- Файл: `MiniTestFramework/TimeoutAttribute.cs`
+  - `3-4` — объявление атрибута для класса/метода.
+  - `6-16` — параметр таймаута в миллисекундах и его проверка.
+- Файл: `MiniTestFramework/TestRunner.cs`
+  - `353-354` — чтение таймаута класса.
+  - `364` — приоритет таймаута метода над таймаутом класса.
+  - `193-199` — выбор таймаута для конкретного запуска теста.
+  - `410-442` — контроль таймаута через `Task.WhenAny`, отмена ожидания и генерация timeout-ошибки.
+  - `222-233` — перевод результата в статус `TimedOut`.
+- Файл: `MiniTestFramework/Exceptions.cs`
+  - `19-21` — добавлено `TestTimeoutException`.
+- Файл: `MiniTestFramework/Models.cs`
+  - `3-9` — добавлен статус `TimedOut`.
+  - `30` — счетчик `TimedOut` в итоговой статистике.
+
+5. Сравнение эффективности: параллельный запуск быстрее последовательного
+- Файл: `Program.cs`
+  - `23-36` — два реальных прогона: последовательный и параллельный.
+  - `38-46` — запись отдельных отчетов и файла сравнения.
+  - `70-87` — расчет времени, коэффициента ускорения (`speedup`) и итоговой сводки.
+- Файл: `Tests/ParallelAndTimeoutDemoTests.cs`
+  - `8-21` — медленные параметризованные тесты (наглядный выигрыш от параллелизма).
+  - `23-28` — отдельный тест для демонстрации срабатывания таймаута.
+
+
+2) Дополнительные изменения для корректной работы в параллели
+--------------------------------------------------------------
+- Файл: `Tests/MathServiceTests.cs`
+  - `37` — `Interlocked.Increment(ref _beforeEachCalls)`.
+  - `43` — `Interlocked.Increment(ref _afterEachCalls)`.
+  Это защищает счетчики lifecycle-хуков при параллельном выполнении.
+
+
+3) Где искать итоговые файлы после запуска
+------------------------------------------
+Каталог: `bin/Debug/net8.0/`
+- `LiveResults.Sequential.log`
+- `LiveResults.Parallel.log`
+- `TestResults.Sequential.txt`
+- `TestResults.Parallel.txt`
+- `TestResults.Comparison.txt`
+
+
+4) Как запускать
+----------------
+- `dotnet build`
+- `dotnet run`
+- `dotnet run -- 4`  (пример явного `MaxDegreeOfParallelism`)
+
+Коротко: **безопасно “убивать” произвольные потоки в .NET нельзя**.
+
+1. **Фоновые потоки (`IsBackground = true`)**  
+Они не держат процесс живым. Когда завершаются все обычные (foreground) потоки, CLR просто завершает процесс, и фоновые потоки обрываются.
+
+2. **Принудительно остановить конкретный поток**  
+Практически нельзя/не рекомендуется. `Thread.Abort` в современном .NET не рабочий путь (`PlatformNotSupportedException`).
+
+3. **Правильный способ остановки**  
+Только кооперативно: `CancellationToken`, флаги остановки, проверка отмены внутри кода.
+
+4. **В твоём случае (таймаут теста)**  
+Раннер может перестать ждать тест и пометить `TimedOut`, но не гарантированно “убивает” выполняющийся код мгновенно.  
+Если нужна жёсткая остановка, обычно выносят выполнение в **отдельный процесс** и убивают уже процесс.
+
+1. Ограничитель параллелизма (`SemaphoreSlim`)  
+Код: `using var semaphore = new SemaphoreSlim(options.MaxDegreeOfParallelism);` в [TestRunner.cs:42](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:42).  
+Как работает: это «турникет». Одновременно внутрь пускает только `N` тестов (где `N = MaxDegreeOfParallelism`).
+
+2. Запуск всех тестов как задач + ожидание завершения  
+Код: создание `executionTasks` в [TestRunner.cs:47](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:47) и `await Task.WhenAll(executionTasks);` в [TestRunner.cs:51](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:51).  
+Как работает: на каждый тест создаётся отдельная задача, потом раннер ждёт, пока закончатся все.
+
+3. Вход/выход через семафор (`WaitAsync`/`Release`)  
+Код: `await semaphore.WaitAsync(...)` в [TestRunner.cs:151](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:151) и `semaphore.Release()` в [TestRunner.cs:158](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:158).  
+Как работает: тест сначала «берёт место», после завершения «освобождает место». Поэтому больше лимита одновременно не запустится.
+
+4. Запуск тестового метода в пуле потоков (`Task.Run`)  
+Код: `return Task.Run(...);` в [TestRunner.cs:450](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:450).  
+Как работает: выполнение теста отдаётся рабочему потоку из `ThreadPool`, а не выполняется строго в текущем потоке.
+
+5. Потокобезопасный сбор результатов (`ConcurrentBag`)  
+Код: `var results = new ConcurrentBag<TestCaseResult>();` в [TestRunner.cs:23](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:23) и `results.Add(result);` в [TestRunner.cs:273](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/TestRunner.cs:273).  
+Как работает: много потоков могут одновременно добавлять результаты без конфликтов.
+
+6. Потокобезопасный вывод в консоль/файл  
+Код: `_gate = new SemaphoreSlim(1, 1)` в [SynchronizedTestOutput.cs:10](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/SynchronizedTestOutput.cs:10), `WaitAsync` в [SynchronizedTestOutput.cs:37](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/SynchronizedTestOutput.cs:37), `Release` в [SynchronizedTestOutput.cs:53](C:/Users/bymer/Desktop/spp1/ConsoleApp1/MiniTestFramework/SynchronizedTestOutput.cs:53).  
+Как работает: в один момент времени пишет только один поток, поэтому строки не перемешиваются.
+
+7. Потокобезопасные счётчики в тестах (`Interlocked`)  
+Код: `Interlocked.Increment(ref _beforeEachCalls);` в [MathServiceTests.cs:37](C:/Users/bymer/Desktop/spp1/ConsoleApp1/Tests/MathServiceTests.cs:37) и `Interlocked.Increment(ref _afterEachCalls);` в [MathServiceTests.cs:43](C:/Users/bymer/Desktop/spp1/ConsoleApp1/Tests/MathServiceTests.cs:43).  
+Как работает: увеличение счётчика атомарное, значения не теряются при одновременной работе потоков.
+
+8. Где задаётся степень параллелизма  
+Код: последовательный режим `MaxDegreeOfParallelism = 1` в [Program.cs:10](C:/Users/bymer/Desktop/spp1/ConsoleApp1/Program.cs:10), параллельный `MaxDegreeOfParallelism = maxParallelism` в [Program.cs:16](C:/Users/bymer/Desktop/spp1/ConsoleApp1/Program.cs:16), чтение из аргументов в [Program.cs:58](C:/Users/bymer/Desktop/spp1/ConsoleApp1/Program.cs:58).  
+Как работает: ты сам управляешь, сколько тестов могут идти одновременно: по одному или сразу несколько.

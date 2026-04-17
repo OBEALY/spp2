@@ -121,6 +121,24 @@ public static class AssertEx
         throw new AssertionFailedException(message ?? $"Expected exception {typeof(TException).Name}, but no exception was thrown.");
     }
 
+    public static void Throws<TException>(Action action, string? message = null) where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+        catch (Exception ex)
+        {
+            throw new AssertionFailedException(message ?? $"Expected {typeof(TException).Name}, but got {ex.GetType().Name}.");
+        }
+
+        throw new AssertionFailedException(message ?? $"Expected exception {typeof(TException).Name}, but no exception was thrown.");
+    }
+
     public static void IsType<TExpected>(object value, string? message = null)
     {
         if (value.GetType() != typeof(TExpected))
